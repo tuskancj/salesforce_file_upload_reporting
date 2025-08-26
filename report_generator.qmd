@@ -1,0 +1,87 @@
+---
+title: "Salesforce Document Upload Report"
+date: last-modified
+format:
+ html:
+   grid:
+      sidebar-width: 1px
+      body-width: 1000px
+      margin-width: 300px
+      gutter-width: 1.5rem
+toc: true
+df-print: kable
+editor: visual
+embed-resources: true
+execute:
+  echo: false
+---
+
+# Region
+
+```{r}
+#packages
+suppressWarnings(suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(lubridate)
+  # library(ggtext)
+  library(ggplot2)
+  library(ggimage)
+  # library(quarto)
+  # library(knitr)
+  library(salesforcer)
+  # library(jsonlite)
+}))
+
+source('../../soql_aid.R')
+
+colors_plot <- c('#1F618D', '#B7950B', '#909497', '#283747', '#922B21')
+
+#log into salesforce
+sf_auth()
+
+# pull down information of person logged in
+# it's a simple easy call to get started 
+# and confirm a connection to the APIs
+user_info <- sf_user_info()
+# sprintf("Organization Id: %s", user_info$organizationId)
+# sprintf("User Id: %s", user_info$userId)
+
+```
+
+
+```{r}
+
+#gather WO information
+soql_wo <- "
+  SELECT WorkOrderNumber, Asset_Serial__c, Id, Status, TechnicianName__c, Work_order_close_date__c
+  FROM WorkOrder 
+  WHERE WorkOrderNumber = '00454590'
+  "
+sf_query(soql_wo)
+```
+
+```{r}
+#gather WO owner information
+
+```
+
+
+```{r}
+#gather file information
+soql_files <- "
+  SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension, ContentDocument.CreatedDate
+  FROM ContentDocumentLink
+  WHERE LinkedEntityId IN (SELECT Id FROM WorkOrder WHERE WorkOrderNumber = '00454590')
+"
+sf_query(soql_files)
+```
+
+
+
+# FSE
+
+```{r}
+to_soql(c('hello', 'world'))
+```
+
