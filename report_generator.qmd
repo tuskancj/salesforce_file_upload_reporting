@@ -34,8 +34,13 @@ suppressWarnings(suppressPackageStartupMessages({
 }))
 
 source('../../soql_aid.R')
+source('../../product_mapping_from_serial_number.R')
 
 colors_plot <- c('#1F618D', '#B7950B', '#909497', '#283747', '#922B21')
+products_of_interest <- c('Aurora',
+                          'Northern Lights',
+                          'Aurora CS',
+                          'Aurora EVO')
 
 #log into salesforce
 sf_auth()
@@ -49,32 +54,114 @@ user_info <- sf_user_info()
 
 ```
 
-
 ```{r}
-
-#gather WO information
-soql_wo <- "
-  SELECT WorkOrderNumber, Asset_Serial__c, Id, Status, TechnicianName__c, Work_order_close_date__c
+#gather batch of unique FSE names so they can be looped through to batch pull WO information
+#(SOQL) is limited in filter sizes and combined queries
+soql_fse <- "
+  SELECT Count(WorkOrderNumber), OwnerId
   FROM WorkOrder 
-  WHERE WorkOrderNumber = '00454590'
+  WHERE Work_order_close_date__c > 2025-06-30T00:00:00Z AND Region__c = 'North America'
+  GROUP BY OwnerId
   "
-sf_query(soql_wo)
+df_fse <- sf_query(soql_fse)
+df_fse <- df_fse %>% rename('wo_count' = 'expr0') %>% select(-attributes.type) %>% arrange(desc(wo_count))
+df_fse
+```
+```{r}
+#work type Id list (these are static for each corresponding type)
+soql_wtype <- "
+  SELECT Name, Id
+  FROM WorkType
+
+  LIMIT 50
+  "
+df_wtype <- sf_query(soql_wtype)
+df_wtype <- df_wtype %>% filter(Name %in% c('Repair', 'PM', 'Preventive Maintenance'))
 ```
 
 ```{r}
-#gather WO owner information
-
+#single owner check
+soql_wo <- paste("
+  SELECT WorkOrderNumber, Asset_Serial__c, Id, Status, TechnicianName__c, Work_order_close_date__c, Region__c, State, WorkTypeId, OwnerId
+  FROM WorkOrder 
+  WHERE Work_order_close_date__c > 2025-06-30T00:00:00Z AND OwnerId = '005Ue000006Lm6GIAS' AND WorkTypeId in ",to_soql(df_wtype$Id),"
+  ", sep = '')
+df_wo_owner <- sf_query(soql_wo)
+df_wo_owner
 ```
 
 
 ```{r}
-#gather file information
-soql_files <- "
+# get Product Name info
+soql_pname <- paste("
+  SELECT SerialNumber, Asset_Detail__c, Id
+  FROM Asset 
+  WHERE SerialNumber in ", to_soql(df_wo_owner$Asset_Serial__c) ,"
+  ", sep = '')
+df_pname <- sf_query(soql_pname) %>% 
+  #gather clean product name
+  mutate(product = sapply(seq_along(SerialNumber), function(i) getProductName(SerialNumber[i], Asset_Detail__c[i]))) %>% 
+  #rename SerialName to match WO df
+  rename('Asset_Serial__c' = 'SerialNumber')
+df_pname
+```
+```{r}
+
+df_filtered_wo <- df_wo_owner %>% 
+  #apply to the work order df
+  left_join(df_pname %>% select(Asset_Serial__c, product), by = 'Asset_Serial__c', relationship = 'many-to-one', multiple = 'first') %>% 
+  #filter to products of interest
+  filter(product %in% products_of_interest)
+df_filtered_wo 
+```
+
+
+```{r}
+#set placeholder df
+df_fse_wo_files <- data.frame(WorkOrderNumber = c(), 
+                              ContentDocument.FileExtension = c(), 
+                              ContentDocument.Title = c())
+
+#for each WO, gather file information
+# for(i in 1:length(df_filtered_wo$Id)){
+for(i in 1:1){
+  soql_files <- paste("
   SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension, ContentDocument.CreatedDate
   FROM ContentDocumentLink
-  WHERE LinkedEntityId IN (SELECT Id FROM WorkOrder WHERE WorkOrderNumber = '00454590')
-"
-sf_query(soql_files)
+  WHERE LinkedEntityId = '",df_filtered_wo$Id[i],"'
+  ", sep = '')
+  
+  #query
+  temp_result <- sf_query(soql_files)
+  
+  #gather the zip file(s)
+  temp_zip <- temp_result %>% filter(ContentDocument.FileExtension == 'zip')
+  #if more than one file, handle
+  if(length(temp_zip$ContentDocumentId)>1){
+    #label files of interest
+    df_temp_zip <- temp_result %>% mutate(file_of_interest = ifelse(str_detect(ContentDocument.Title, 'InstrumentDataBackup'), T, F))
+    if(length(df_temp_zip %>% filter(file_of_interest == T))>0){
+      #gather the first file of interest
+      temp_zip <- (df_temp_zip %>% filter(file_of_interest == T))$ContentDocument.Title[1]
+    }
+    else{
+      #return the first file
+      temp_zip <- df_temp_zip$ContentDocument.Title[1]
+    }
+  }
+  
+  #gather the xlsx files
+  temp_xlsx <- temp_result %>% filter(ContentDocument.FileExtension == 'xlsx')
+  
+  
+  temp_pdf <- temp_result %>% filter(ContentDocument.FileExtension == 'pdf')
+  
+  temp_wo <- df_filtered_wo$Id[i]
+  
+  #add to df
+  df_temp <- data.frame()
+}
+
 ```
 
 
