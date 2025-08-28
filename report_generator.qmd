@@ -15,8 +15,7 @@ embed-resources: true
 execute:
   echo: false
 ---
-
-# Region
+# Setup {.hidden .unnumbered .unlisted}
 
 ```{r}
 #packages
@@ -24,23 +23,60 @@ suppressWarnings(suppressPackageStartupMessages({
   library(tidyverse)
   library(janitor)
   library(lubridate)
-  # library(ggtext)
   library(ggplot2)
   library(ggimage)
-  # library(quarto)
-  # library(knitr)
   library(salesforcer)
-  # library(jsonlite)
+  library(stringr)
 }))
 
 source('../../soql_aid.R')
 source('../../product_mapping_from_serial_number.R')
+source('../../lists.R')
 
+#variables
+query_sfdc <- F #if T, will query SFDC database, otherwise pull from saved file
 colors_plot <- c('#1F618D', '#B7950B', '#909497', '#283747', '#922B21')
 products_of_interest <- c('Aurora',
                           'Northern Lights',
                           'Aurora CS',
-                          'Aurora EVO')
+                          'Aurora Evo')
+date_of_interest <- '2025-06-30T00:00:00Z' #WOs after this date will be processed
+date_of_interest_simple <- strsplit(date_of_interest, 'T')[[1]][1]
+
+```
+
+```{r}
+
+#functions:
+#validating file type by extension and keyword
+#e.g. if looking for xml with keyword 'test' in the filename, this will return the most recent top match for filetype along with 1/0 flag if it contains the keyword
+file_check <- function(files_df, file_extension, file_keyword){
+  #filter by file type
+  files_df <- files_df %>% filter(ContentDocument.FileExtension == file_extension)
+  
+  #if no files, return original df
+  if(length(files_df$ContentDocumentId)==0){
+    #add blank file_of_interest column and fill first row with NA
+    files_df <- files_df %>% mutate(file_of_interest = NA)
+    files_df[1, ] <- NA
+    return(files_df)
+  }
+  #if more than one file, handle
+  else{
+    file_df_temp <- files_df %>% mutate(file_of_interest = ifelse(str_detect(ContentDocument.Title, file_keyword)==T, 1, 0))
+    file_df_final <- data.frame()
+    
+    #if a file of interest exists, capture the most recent, otherwise just capture the most recent without file_of_interest tag
+    if(length((file_df_temp %>% filter(file_of_interest == 1))$ContentDocumentId)>0){
+      file_df_final <- file_df_temp %>% filter(file_of_interest == 1) %>% arrange(desc(ContentDocument.CreatedDate)) %>% first()
+    }
+    else{
+      file_df_final <- file_df_temp %>% arrange(desc(ContentDocument.CreatedDate)) %>% first()
+    }
+    
+    return(file_df_final)
+  }
+}
 
 #log into salesforce
 sf_auth()
@@ -49,126 +85,356 @@ sf_auth()
 # it's a simple easy call to get started 
 # and confirm a connection to the APIs
 user_info <- sf_user_info()
+# sf_control(api_usage = TRUE) #api verbose to console
 # sprintf("Organization Id: %s", user_info$organizationId)
 # sprintf("User Id: %s", user_info$userId)
 
 ```
 
-```{r}
-#gather batch of unique FSE names so they can be looped through to batch pull WO information
-#(SOQL) is limited in filter sizes and combined queries
-soql_fse <- "
-  SELECT Count(WorkOrderNumber), OwnerId
-  FROM WorkOrder 
-  WHERE Work_order_close_date__c > 2025-06-30T00:00:00Z AND Region__c = 'North America'
-  GROUP BY OwnerId
-  "
-df_fse <- sf_query(soql_fse)
-df_fse <- df_fse %>% rename('wo_count' = 'expr0') %>% select(-attributes.type) %>% arrange(desc(wo_count))
-df_fse
-```
-```{r}
-#work type Id list (these are static for each corresponding type)
-soql_wtype <- "
-  SELECT Name, Id
-  FROM WorkType
+# SFDC Querying {.hidden .unnumbered .unlisted}
 
-  LIMIT 50
-  "
-df_wtype <- sf_query(soql_wtype)
-df_wtype <- df_wtype %>% filter(Name %in% c('Repair', 'PM', 'Preventive Maintenance'))
-```
-
-```{r}
-#single owner check
-soql_wo <- paste("
-  SELECT WorkOrderNumber, Asset_Serial__c, Id, Status, TechnicianName__c, Work_order_close_date__c, Region__c, State, WorkTypeId, OwnerId
-  FROM WorkOrder 
-  WHERE Work_order_close_date__c > 2025-06-30T00:00:00Z AND OwnerId = '005Ue000006Lm6GIAS' AND WorkTypeId in ",to_soql(df_wtype$Id),"
-  ", sep = '')
-df_wo_owner <- sf_query(soql_wo)
-df_wo_owner
-```
-
-
-```{r}
-# get Product Name info
-soql_pname <- paste("
-  SELECT SerialNumber, Asset_Detail__c, Id
-  FROM Asset 
-  WHERE SerialNumber in ", to_soql(df_wo_owner$Asset_Serial__c) ,"
-  ", sep = '')
-df_pname <- sf_query(soql_pname) %>% 
-  #gather clean product name
-  mutate(product = sapply(seq_along(SerialNumber), function(i) getProductName(SerialNumber[i], Asset_Detail__c[i]))) %>% 
-  #rename SerialName to match WO df
-  rename('Asset_Serial__c' = 'SerialNumber')
-df_pname
-```
-```{r}
-
-df_filtered_wo <- df_wo_owner %>% 
-  #apply to the work order df
-  left_join(df_pname %>% select(Asset_Serial__c, product), by = 'Asset_Serial__c', relationship = 'many-to-one', multiple = 'first') %>% 
-  #filter to products of interest
-  filter(product %in% products_of_interest)
-df_filtered_wo 
-```
-
-
-```{r}
-#set placeholder df
-df_fse_wo_files <- data.frame(WorkOrderNumber = c(), 
-                              ContentDocument.FileExtension = c(), 
-                              ContentDocument.Title = c())
-
-#for each WO, gather file information
-# for(i in 1:length(df_filtered_wo$Id)){
-for(i in 1:1){
-  soql_files <- paste("
-  SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension, ContentDocument.CreatedDate
-  FROM ContentDocumentLink
-  WHERE LinkedEntityId = '",df_filtered_wo$Id[i],"'
-  ", sep = '')
+```{r, results='hide', echo=FALSE}
+if(query_sfdc == T){
+  start_time <- Sys.time()
+  message(start_time)
   
-  #query
-  temp_result <- sf_query(soql_files)
+  #set placeholder df for all wo information
+  df_wo_files_for_all_fse <- data.frame(work_order = c(),
+                                work_order_type = c(),
+                                work_order_status = c(),
+                                work_order_close_date = c(),
+                                fse = c(),
+                                serial_number = c(),
+                                product = c(),
+                                region = c(),
+                                state = c(),
+                                xlsx = c(),
+                                xlsx_foi = c(),
+                                zip = c(),
+                                zip_foi = c(),
+                                pdf = c(),
+                                pdf_foi = c())
   
-  #gather the zip file(s)
-  temp_zip <- temp_result %>% filter(ContentDocument.FileExtension == 'zip')
-  #if more than one file, handle
-  if(length(temp_zip$ContentDocumentId)>1){
-    #label files of interest
-    df_temp_zip <- temp_result %>% mutate(file_of_interest = ifelse(str_detect(ContentDocument.Title, 'InstrumentDataBackup'), T, F))
-    if(length(df_temp_zip %>% filter(file_of_interest == T))>0){
-      #gather the first file of interest
-      temp_zip <- (df_temp_zip %>% filter(file_of_interest == T))$ContentDocument.Title[1]
-    }
-    else{
-      #return the first file
-      temp_zip <- df_temp_zip$ContentDocument.Title[1]
+  #####################################################################
+  #gather work type Id list (these are static for each corresponding type)
+  #####################################################################
+  soql_wtype <- "
+    SELECT Name, Id
+    FROM WorkType
+  
+    LIMIT 50
+    "
+  df_wtype <- sf_query(soql_wtype)
+  df_wtype <- df_wtype %>% 
+    filter(Name %in% c('Repair', 'PM', 'Preventive Maintenance')) %>% 
+    rename('WorkTypeId' = 'Id', 'wo_type' = 'Name')
+  
+  #####################################################################
+  #gather batch of unique FSE names so they can be looped through to batch pull WO information
+  #####################################################################
+  #(SOQL) is limited in filter sizes and combined queries
+  soql_fse <- paste("
+    SELECT Count(WorkOrderNumber), OwnerId
+    FROM WorkOrder 
+    WHERE Work_order_close_date__c > ", date_of_interest, " AND Region__c = 'North America'
+    GROUP BY OwnerId
+    ", sep = '')
+  df_fse <- sf_query(soql_fse)
+  df_fse <- df_fse %>% rename('wo_count' = 'expr0') %>% select(-attributes.type) %>% arrange(desc(wo_count))
+  
+  #####################################################################
+  #1. loop through FSE to gather list of WO
+  #2.   clean up WO df
+  #3.   loop through each WO to process filetypes uploaded to each WO
+  #4.     add individual WO results to FSE df
+  #5.   add to overall df
+  #####################################################################
+  for(fse_id in 1:length(df_fse$OwnerId)){
+  # for(fse_id in 26:length(df_fse$OwnerId)){ #troubleshooting
+    #single owner (FSE) WO df
+    soql_wo <- paste("
+      SELECT WorkOrderNumber, Asset_Serial__c, Id, Status, TechnicianName__c, Work_order_close_date__c, Region__c, State, WorkTypeId, OwnerId
+      FROM WorkOrder 
+      WHERE Work_order_close_date__c > ", date_of_interest, " AND OwnerId = '", df_fse$OwnerId[fse_id],"' AND WorkTypeId in ",to_soql(df_wtype$WorkTypeId),"
+      ", sep = '')
+    df_wo_owner <- sf_query(soql_wo)
+    
+    #ensure there are work orders to query
+    if(nrow(df_wo_owner)>0){
+      # get Product Name info
+      soql_pname <- paste("
+        SELECT SerialNumber, Asset_Detail__c, Id
+        FROM Asset 
+        WHERE SerialNumber in ", to_soql(df_wo_owner$Asset_Serial__c) ,"
+        ", sep = '')
+      df_pname <- sf_query(soql_pname) %>% 
+        #gather clean product name
+        mutate(product = sapply(seq_along(SerialNumber), function(i) getProductName(SerialNumber[i], Asset_Detail__c[i]))) %>% 
+        #rename SerialName to match WO df
+        rename('Asset_Serial__c' = 'SerialNumber')
+      
+      #final WO df - join product, work order type, and filter to products of interest
+      df_filtered_wo <- df_wo_owner %>% 
+        #join product name
+        left_join(df_pname %>% select(Asset_Serial__c, product), by = 'Asset_Serial__c', relationship = 'many-to-one', multiple = 'first') %>% 
+        #filter to products of interest
+        filter(product %in% products_of_interest) %>% 
+        #join Work Order Type
+        left_join(df_wtype, by = 'WorkTypeId', relationship = 'many-to-one', multiple = 'first')
+      
+      #ensure there are WOs on products of interest
+      if(nrow(df_filtered_wo)>0){
+        #set placeholder df for FSE
+        df_wo_files_for_fse <- data.frame(work_order = c(),
+                                      work_order_type = c(),
+                                      work_order_status = c(),
+                                      work_order_close_date = c(),
+                                      fse = c(),
+                                      serial_number = c(),
+                                      product = c(),
+                                      region = c(),
+                                      state = c(),
+                                      xlsx = c(),
+                                      xlsx_foi = c(),
+                                      zip = c(),
+                                      zip_foi = c(),
+                                      pdf = c(),
+                                      pdf_foi = c())
+        
+        #for each WO, gather file information
+        for(i in 1:length(df_filtered_wo$Id)){
+        # for(i in 9:9){ # for troubleshooting
+          soql_files <- paste("
+          SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension, ContentDocument.CreatedDate
+          FROM ContentDocumentLink
+          WHERE LinkedEntityId = '",df_filtered_wo$Id[i],"'
+          ", sep = '')
+          
+          #query
+          df_temp_result <- sf_query(soql_files)
+          
+          #placeholder df
+          df_single_wo_info <- data.frame()
+          
+          #if files are uploaded to the wo, process
+          if(length(df_temp_result)>0){
+            #gather the zip file
+            df_temp_zip <- file_check(df_temp_result, 'zip', 'InstrumentDataBackup')
+            
+            #gather the xlsx file
+            df_temp_xlsx <- file_check(df_temp_result, 'xlsx', regex("qual", ignore_case = TRUE))
+            
+            #gather the pdf file
+            df_temp_pdf <- file_check(df_temp_result, 'pdf', 'ServiceReport')
+            
+            #add to df
+            df_single_wo_info <- data.frame(work_order = c(df_filtered_wo$WorkOrderNumber[i]),
+                                            work_order_type = c(df_filtered_wo$wo_type[i]),
+                                            work_order_status = c(df_filtered_wo$Status[i]),
+                                            work_order_close_date = c(df_filtered_wo$Work_order_close_date__c[i]),
+                                            fse = c(df_filtered_wo$TechnicianName__c[i]),
+                                            serial_number = c(df_filtered_wo$Asset_Serial__c[i]),
+                                            product = c(df_filtered_wo$product[i]),
+                                            region = c(df_filtered_wo$Region__c[i]),
+                                            state = c(df_filtered_wo$State[i]),
+                                            xlsx = c(df_temp_xlsx$ContentDocument.Title[1]),
+                                            xlsx_foi = c(df_temp_xlsx$file_of_interest[1]),
+                                            zip = c(df_temp_zip$ContentDocument.Title[1]),
+                                            zip_foi = c(df_temp_zip$file_of_interest[1]),
+                                            pdf = c(df_temp_pdf$ContentDocument.Title[1]),
+                                            pdf_foi = c(df_temp_pdf$file_of_interest[1]))
+          }
+          else{
+            #no files uploaded to WO
+            df_single_wo_info <- data.frame(work_order = c(df_filtered_wo$WorkOrderNumber[i]),
+                                            work_order_type = c(df_filtered_wo$wo_type[i]),
+                                            work_order_status = c(df_filtered_wo$Status[i]),
+                                            work_order_close_date = c(df_filtered_wo$Work_order_close_date__c[i]),
+                                            fse = c(df_filtered_wo$TechnicianName__c[i]),
+                                            serial_number = c(df_filtered_wo$Asset_Serial__c[i]),
+                                            product = c(df_filtered_wo$product[i]),
+                                            region = c(df_filtered_wo$Region__c[i]),
+                                            state = c(df_filtered_wo$State[i]),
+                                            xlsx = c(NA),
+                                            xlsx_foi = c(NA),
+                                            zip = c(NA),
+                                            zip_foi = c(NA),
+                                            pdf = c(NA),
+                                            pdf_foi = c(NA))
+          }
+          
+          #append to fse df
+          df_wo_files_for_fse <- df_wo_files_for_fse %>% rbind(df_single_wo_info)
+          
+          #sleep in between WOs due to SOQL bandwidth limits
+          # Sys.sleep(0.25)
+        }
+      }
+      #append fse df to full df
+      df_wo_files_for_all_fse <- df_wo_files_for_all_fse %>% rbind(df_wo_files_for_fse)
     }
   }
   
-  #gather the xlsx files
-  temp_xlsx <- temp_result %>% filter(ContentDocument.FileExtension == 'xlsx')
+  write_csv(df_wo_files_for_all_fse, 'latest_query_results.csv')
   
-  
-  temp_pdf <- temp_result %>% filter(ContentDocument.FileExtension == 'pdf')
-  
-  temp_wo <- df_filtered_wo$Id[i]
-  
-  #add to df
-  df_temp <- data.frame()
+  end_time <- Sys.time()
+  message(end_time)
+}else{
+  df_wo_files_for_all_fse <- read_csv('latest_query_results.csv')
 }
-
 ```
 
+# Overview
 
+The purpose of this document is to observe the file types uploaded to each Work Order in Salesforce.  
 
-# FSE
+## Preventive Maintenance 
+
+Every closed Spectral PM Work Order should have the following files uploaded to the 'Files' Section:
+
+* .xlsx qualification form
+* .zip InstrumentDataBackup
+
+## Service Report
+
+Every Work Order (regardless of instrument) should have a Service Report generated and sent to the customer:
+
+* .pdf Service Report
+
+# Region PM Work Orders
+
+## Qual Form Attachment
 
 ```{r}
-to_soql(c('hello', 'world'))
+df_results <- df_wo_files_for_all_fse %>% filter(work_order_type != 'Repair') %>% 
+  mutate(zip_exists = ifelse(is.na(zip), 0, 1)) %>% 
+  mutate(pdf_exists = ifelse(is.na(pdf), 0, 1)) %>% 
+  mutate(xlsx_exists = ifelse(is.na(xlsx), 0, 1)) %>% 
+  mutate(zip_foi = ifelse(is.na(zip_foi), 0, zip_foi)) %>% 
+  mutate(pdf_foi = ifelse(is.na(pdf_foi), 0, pdf_foi)) %>% 
+  mutate(xlsx_foi = ifelse(is.na(xlsx_foi), 0, xlsx_foi)) %>% 
+  mutate(district = case_when(fse %in% list_fse_central_us ~ 'US-Central',
+                              fse %in% list_fse_northeast_us ~ 'US-Northeast',
+                              fse %in% list_fse_western_us ~ 'US-Western',
+                              .default = NA)) %>% 
+  filter(!is.na(district))
+
+df_results_district <- df_results %>% 
+  group_by(district) %>% 
+  summarize(wo_count = length(unique(work_order)),
+           p_zips = mean(zip_exists),
+           p_conf_zips = mean(zip_foi),
+           p_pdfs = mean(pdf_exists),
+           p_conf_pdfs = mean(pdf_foi),
+           p_xlsx = mean(xlsx_exists),
+           p_conf_xlsx = mean(xlsx_foi),
+           .groups = 'drop')
+# df_results_district
 ```
+
+```{r, fig.width=9}
+point_size_range <- c(20,30)
+
+g_region <- ggplot(df_results_district, aes(x = p_xlsx, y = reorder(district, p_xlsx)), col = district) +
+    geom_segment(aes(x = 0, xend = p_xlsx, y = district, yend = district, color = district), linewidth = 5) +
+    geom_point(aes(size = wo_count, color = district, fill = 'white'), shape = 21, stroke = 1) +
+    scale_size_continuous(range = point_size_range)+
+    geom_text(aes(label = paste(round(p_xlsx*100, 0), '%', sep='')), hjust = .45, vjust = .33, size = 5, fontface = "bold", color = 'black')+
+    geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+                  hjust = -1.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*0.2, 
+                  vjust = 0.33), 
+              size = 4, 
+              color = 'darkgray')+
+    annotate('text', label = '(Closed Work Order Count)', x = 0.95, y = .5, size = 4, color = 'darkgray')+
+    # scale_color_manual(values = colors_plot[1:3])+
+  scale_color_manual(values = c('US-Central' = colors_plot[1], 'US-Northeast' = colors_plot[3], 'US-Western' = colors_plot[2]))+
+    scale_fill_manual(values = 'white')+
+    scale_x_continuous(labels = scales::percent_format(), limits = c(0,1.1), breaks = seq(0,1,0.1))+
+    labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.xlsx' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+    theme_minimal()+
+    theme(legend.position = 'none', 
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size = 10, color = 'black'))
+g_region
+```
+
+
+```{r}
+df_results_fse <- df_results %>% 
+  group_by(district, fse) %>% 
+  summarize(wo_count = length(unique(work_order)),
+           p_zips = mean(zip_exists),
+           p_conf_zips = mean(zip_foi),
+           p_pdfs = mean(pdf_exists),
+           p_conf_pdfs = mean(pdf_foi),
+           p_xlsx = mean(xlsx_exists),
+           p_conf_xlsx = mean(xlsx_foi),
+           .groups = 'drop')
+
+```
+
+```{r}
+plot_district <- function(selected_plot_color, selected_district){
+  point_size_range = c(20,35)
+  g_district <- ggplot(df_results_fse %>% filter(district == selected_district), aes(x = p_xlsx, y = reorder(fse, p_xlsx)), col = selected_plot_color) +
+    geom_segment(aes(x = 0, xend = p_xlsx, y = fse, yend = fse, color = selected_plot_color), linewidth = 5) +
+    geom_point(aes(size = wo_count, color = selected_plot_color, fill = 'white'), shape = 21, stroke = 1) +
+    scale_size_continuous(range = point_size_range)+
+    geom_text(aes(label = paste(round(p_xlsx*100, 0), '%', sep='')), hjust = .45, vjust = .33, fontface = "bold", size = 5)+
+    geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+                  hjust = -2.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*.1, 
+                  vjust = 0.33), 
+              size = 4, 
+              color = 'darkgray')+
+    annotate('text', label = '(Closed Work Order Count)', x = 1, y = 0.55, size = 4, color = 'darkgray')+
+    scale_color_manual(values = selected_plot_color)+
+    scale_fill_manual(values = 'white')+
+    scale_x_continuous(labels = scales::percent_format(), limits = c(-0.1,1.2), breaks = seq(-0.1,1.2,0.1))+
+    labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.xlsx' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+    theme_minimal()+
+    theme(legend.position = 'none',
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size = 10, color = 'black'))
+  return(g_district)
+}
+```
+
+# FSE PM Work Orders
+
+## Qual Form Attachment
+
+### US-Central
+
+```{r, fig.height=15, fig.width=9}
+
+#central
+g_central <- plot_district(colors_plot[1], 'US-Central')
+g_central
+```
+
+
+### US-Northeast
+```{r, fig.height=15, fig.width=9}
+
+#northeast
+g_northeast <- plot_district(colors_plot[3], 'US-Northeast')
+g_northeast
+```
+
+### US-Western
+```{r, fig.height=15, fig.width=9}
+
+#west
+g_west <- plot_district(colors_plot[2], 'US-Western')
+g_west
+```
+
+# plots to png {.hidden .unnumbered .unlisted}
+```{r}
+# ggsave(filename = 'districts.png', plot = g_region, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'central.png', plot = g_central, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'northeast.png', plot = g_northeast, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'western.png', plot = g_western, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
+```
+
 
