@@ -5,7 +5,7 @@ format:
  html:
    grid:
       sidebar-width: 1px
-      body-width: 1000px
+      body-width: 3000px
       margin-width: 300px
       gutter-width: 1.5rem
 toc: true
@@ -24,9 +24,11 @@ suppressWarnings(suppressPackageStartupMessages({
   library(janitor)
   library(lubridate)
   library(ggplot2)
+  library(ggpattern)
   library(ggimage)
   library(salesforcer)
   library(stringr)
+  library(DT)
 }))
 
 source('../../soql_aid.R')
@@ -36,11 +38,11 @@ source('../../lists.R')
 #variables
 query_sfdc <- F #if T, will query SFDC database, otherwise pull from saved file
 colors_plot <- c('#1F618D', '#B7950B', '#909497', '#283747', '#922B21')
-products_of_interest <- c('Aurora',
+spectral_products <- c('Aurora',
                           'Northern Lights',
                           'Aurora CS',
                           'Aurora Evo')
-date_of_interest <- '2025-06-30T00:00:00Z' #WOs after this date will be processed
+date_of_interest <- '2025-06-30T00:00:00Z' #WOs closed after this date will be processed
 date_of_interest_simple <- strsplit(date_of_interest, 'T')[[1]][1]
 
 ```
@@ -105,7 +107,7 @@ if(query_sfdc == T){
                                 work_order_close_date = c(),
                                 fse = c(),
                                 serial_number = c(),
-                                product = c(),
+                                product_2_id = c(),
                                 region = c(),
                                 state = c(),
                                 xlsx = c(),
@@ -121,12 +123,10 @@ if(query_sfdc == T){
   soql_wtype <- "
     SELECT Name, Id
     FROM WorkType
-  
-    LIMIT 50
     "
   df_wtype <- sf_query(soql_wtype)
   df_wtype <- df_wtype %>% 
-    filter(Name %in% c('Repair', 'PM', 'Preventive Maintenance')) %>% 
+    # filter(Name %in% c('Repair', 'PM', 'Preventive Maintenance')) %>% 
     rename('WorkTypeId' = 'Id', 'wo_type' = 'Name')
   
   #####################################################################
@@ -151,134 +151,163 @@ if(query_sfdc == T){
   #####################################################################
   for(fse_id in 1:length(df_fse$OwnerId)){
   # for(fse_id in 26:length(df_fse$OwnerId)){ #troubleshooting
+  # for(fse_id in 1:1){ #troubleshooting
     #single owner (FSE) WO df
     soql_wo <- paste("
       SELECT WorkOrderNumber, Asset_Serial__c, Id, Status, TechnicianName__c, Work_order_close_date__c, Region__c, State, WorkTypeId, OwnerId
       FROM WorkOrder 
-      WHERE Work_order_close_date__c > ", date_of_interest, " AND OwnerId = '", df_fse$OwnerId[fse_id],"' AND WorkTypeId in ",to_soql(df_wtype$WorkTypeId),"
-      ", sep = '')
+      WHERE Work_order_close_date__c > ", date_of_interest, " AND OwnerId = '", df_fse$OwnerId[fse_id],"'", 
+      sep = '')
     df_wo_owner <- sf_query(soql_wo)
     
     #ensure there are work orders to query
     if(nrow(df_wo_owner)>0){
-      # get Product Name info
-      soql_pname <- paste("
-        SELECT SerialNumber, Asset_Detail__c, Id
-        FROM Asset 
+      # get product id from serial number
+      soql_pid <- paste("
+        SELECT SerialNumber, Product2Id
+        FROM Asset
         WHERE SerialNumber in ", to_soql(df_wo_owner$Asset_Serial__c) ,"
         ", sep = '')
-      df_pname <- sf_query(soql_pname) %>% 
-        #gather clean product name
-        mutate(product = sapply(seq_along(SerialNumber), function(i) getProductName(SerialNumber[i], Asset_Detail__c[i]))) %>% 
+      df_pid <- sf_query(soql_pid) %>%
         #rename SerialName to match WO df
-        rename('Asset_Serial__c' = 'SerialNumber')
+        rename('Asset_Serial__c' = 'SerialNumber',
+               'product_2_id' = 'Product2Id')
       
       #final WO df - join product, work order type, and filter to products of interest
-      df_filtered_wo <- df_wo_owner %>% 
-        #join product name
-        left_join(df_pname %>% select(Asset_Serial__c, product), by = 'Asset_Serial__c', relationship = 'many-to-one', multiple = 'first') %>% 
-        #filter to products of interest
-        filter(product %in% products_of_interest) %>% 
+      df_filtered_wo <- df_wo_owner %>%
+        #join product id
+        left_join(df_pid, by = 'Asset_Serial__c', relationship = 'many-to-one', multiple = 'first') %>% 
         #join Work Order Type
         left_join(df_wtype, by = 'WorkTypeId', relationship = 'many-to-one', multiple = 'first')
       
-      #ensure there are WOs on products of interest
-      if(nrow(df_filtered_wo)>0){
-        #set placeholder df for FSE
-        df_wo_files_for_fse <- data.frame(work_order = c(),
-                                      work_order_type = c(),
-                                      work_order_status = c(),
-                                      work_order_close_date = c(),
-                                      fse = c(),
-                                      serial_number = c(),
-                                      product = c(),
-                                      region = c(),
-                                      state = c(),
-                                      xlsx = c(),
-                                      xlsx_foi = c(),
-                                      zip = c(),
-                                      zip_foi = c(),
-                                      pdf = c(),
-                                      pdf_foi = c())
+      #set placeholder df for FSE
+      df_wo_files_for_fse <- data.frame(work_order = c(),
+                                    work_order_type = c(),
+                                    work_order_status = c(),
+                                    work_order_close_date = c(),
+                                    fse = c(),
+                                    serial_number = c(),
+                                    product_2_id = c(),
+                                    region = c(),
+                                    state = c(),
+                                    xlsx = c(),
+                                    xlsx_foi = c(),
+                                    zip = c(),
+                                    zip_foi = c(),
+                                    pdf = c(),
+                                    pdf_foi = c())
+      
+      #for each WO, gather file information
+      for(i in 1:length(df_filtered_wo$Id)){
+      # for(i in 9:9){ # for troubleshooting
+        soql_files <- paste("
+        SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension, ContentDocument.CreatedDate
+        FROM ContentDocumentLink
+        WHERE LinkedEntityId = '",df_filtered_wo$Id[i],"'
+        ", sep = '')
         
-        #for each WO, gather file information
-        for(i in 1:length(df_filtered_wo$Id)){
-        # for(i in 9:9){ # for troubleshooting
-          soql_files <- paste("
-          SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension, ContentDocument.CreatedDate
-          FROM ContentDocumentLink
-          WHERE LinkedEntityId = '",df_filtered_wo$Id[i],"'
-          ", sep = '')
+        #query
+        df_temp_result <- sf_query(soql_files)
+        
+        #placeholder df
+        df_single_wo_info <- data.frame()
+        
+        #if files are uploaded to the wo, process
+        if(length(df_temp_result)>0){
+          #gather the zip file
+          df_temp_zip <- file_check(df_temp_result, 'zip', 'InstrumentDataBackup')
           
-          #query
-          df_temp_result <- sf_query(soql_files)
+          #gather the xlsx file
+          df_temp_xlsx <- file_check(df_temp_result, 'xlsx', regex("qual", ignore_case = TRUE))
           
-          #placeholder df
-          df_single_wo_info <- data.frame()
+          #gather the pdf file
+          df_temp_pdf <- file_check(df_temp_result, 'pdf', 'ServiceReport')
           
-          #if files are uploaded to the wo, process
-          if(length(df_temp_result)>0){
-            #gather the zip file
-            df_temp_zip <- file_check(df_temp_result, 'zip', 'InstrumentDataBackup')
-            
-            #gather the xlsx file
-            df_temp_xlsx <- file_check(df_temp_result, 'xlsx', regex("qual", ignore_case = TRUE))
-            
-            #gather the pdf file
-            df_temp_pdf <- file_check(df_temp_result, 'pdf', 'ServiceReport')
-            
-            #add to df
-            df_single_wo_info <- data.frame(work_order = c(df_filtered_wo$WorkOrderNumber[i]),
-                                            work_order_type = c(df_filtered_wo$wo_type[i]),
-                                            work_order_status = c(df_filtered_wo$Status[i]),
-                                            work_order_close_date = c(df_filtered_wo$Work_order_close_date__c[i]),
-                                            fse = c(df_filtered_wo$TechnicianName__c[i]),
-                                            serial_number = c(df_filtered_wo$Asset_Serial__c[i]),
-                                            product = c(df_filtered_wo$product[i]),
-                                            region = c(df_filtered_wo$Region__c[i]),
-                                            state = c(df_filtered_wo$State[i]),
-                                            xlsx = c(df_temp_xlsx$ContentDocument.Title[1]),
-                                            xlsx_foi = c(df_temp_xlsx$file_of_interest[1]),
-                                            zip = c(df_temp_zip$ContentDocument.Title[1]),
-                                            zip_foi = c(df_temp_zip$file_of_interest[1]),
-                                            pdf = c(df_temp_pdf$ContentDocument.Title[1]),
-                                            pdf_foi = c(df_temp_pdf$file_of_interest[1]))
-          }
-          else{
-            #no files uploaded to WO
-            df_single_wo_info <- data.frame(work_order = c(df_filtered_wo$WorkOrderNumber[i]),
-                                            work_order_type = c(df_filtered_wo$wo_type[i]),
-                                            work_order_status = c(df_filtered_wo$Status[i]),
-                                            work_order_close_date = c(df_filtered_wo$Work_order_close_date__c[i]),
-                                            fse = c(df_filtered_wo$TechnicianName__c[i]),
-                                            serial_number = c(df_filtered_wo$Asset_Serial__c[i]),
-                                            product = c(df_filtered_wo$product[i]),
-                                            region = c(df_filtered_wo$Region__c[i]),
-                                            state = c(df_filtered_wo$State[i]),
-                                            xlsx = c(NA),
-                                            xlsx_foi = c(NA),
-                                            zip = c(NA),
-                                            zip_foi = c(NA),
-                                            pdf = c(NA),
-                                            pdf_foi = c(NA))
-          }
-          
-          #append to fse df
-          df_wo_files_for_fse <- df_wo_files_for_fse %>% rbind(df_single_wo_info)
-          
-          #sleep in between WOs due to SOQL bandwidth limits
-          # Sys.sleep(0.25)
+          #add to df
+          df_single_wo_info <- data.frame(work_order = c(df_filtered_wo$WorkOrderNumber[i]),
+                                          work_order_type = c(df_filtered_wo$wo_type[i]),
+                                          work_order_status = c(df_filtered_wo$Status[i]),
+                                          work_order_close_date = c(df_filtered_wo$Work_order_close_date__c[i]),
+                                          fse = c(df_filtered_wo$TechnicianName__c[i]),
+                                          serial_number = c(df_filtered_wo$Asset_Serial__c[i]),
+                                          product_2_id = c(df_filtered_wo$product_2_id[i]),
+                                          region = c(df_filtered_wo$Region__c[i]),
+                                          state = c(df_filtered_wo$State[i]),
+                                          xlsx = c(df_temp_xlsx$ContentDocument.Title[1]),
+                                          xlsx_foi = c(df_temp_xlsx$file_of_interest[1]),
+                                          zip = c(df_temp_zip$ContentDocument.Title[1]),
+                                          zip_foi = c(df_temp_zip$file_of_interest[1]),
+                                          pdf = c(df_temp_pdf$ContentDocument.Title[1]),
+                                          pdf_foi = c(df_temp_pdf$file_of_interest[1]))
         }
+        else{
+          #no files uploaded to WO
+          df_single_wo_info <- data.frame(work_order = c(df_filtered_wo$WorkOrderNumber[i]),
+                                          work_order_type = c(df_filtered_wo$wo_type[i]),
+                                          work_order_status = c(df_filtered_wo$Status[i]),
+                                          work_order_close_date = c(df_filtered_wo$Work_order_close_date__c[i]),
+                                          fse = c(df_filtered_wo$TechnicianName__c[i]),
+                                          serial_number = c(df_filtered_wo$Asset_Serial__c[i]),
+                                          product_2_id = c(df_filtered_wo$product_2_id[i]),
+                                          region = c(df_filtered_wo$Region__c[i]),
+                                          state = c(df_filtered_wo$State[i]),
+                                          xlsx = c(NA),
+                                          xlsx_foi = c(NA),
+                                          zip = c(NA),
+                                          zip_foi = c(NA),
+                                          pdf = c(NA),
+                                          pdf_foi = c(NA))
+        }
+        
+        #append to fse df
+        df_wo_files_for_fse <- df_wo_files_for_fse %>% rbind(df_single_wo_info)
+        
+        #sleep in between WOs due to SOQL bandwidth limits
+        # Sys.sleep(0.25)
       }
+      # }
       #append fse df to full df
       df_wo_files_for_all_fse <- df_wo_files_for_all_fse %>% rbind(df_wo_files_for_fse)
     }
   }
   
+  #get dirty product name here based on unique product2 id
+  soql_pname <- paste("
+        SELECT Id, Name
+        FROM Product2 
+        WHERE Id in ", to_soql(na.omit(unique(df_wo_files_for_all_fse$product_2_id))),
+        sep = '')
+  df_pname <- sf_query(soql_pname) %>% 
+    rename('product_2_id' = 'Id',
+           'name_long' = 'Name')
+  
+  #generate clean product name
+  df_wo_files_for_all_fse <- df_wo_files_for_all_fse %>% 
+    left_join(df_pname, by = 'product_2_id', relationship = 'many-to-one', multiple = 'first') %>% 
+    mutate(product = sapply(seq_along(serial_number), function(i) getProductName(serial_number[i], name_long[i]))) %>% 
+    select(work_order, 
+           work_order_type,
+           work_order_status,
+           work_order_close_date,
+           fse,
+           serial_number,
+           product, 
+           region,
+           state,
+           xlsx,
+           xlsx_foi,
+           zip,
+           zip_foi,
+           pdf,
+           pdf_foi)
+  
+  
+  #save locally
   write_csv(df_wo_files_for_all_fse, 'latest_query_results.csv')
   
   end_time <- Sys.time()
   message(end_time)
+  message(end_time-start_time)
 }else{
   df_wo_files_for_all_fse <- read_csv('latest_query_results.csv')
 }
@@ -295,18 +324,24 @@ Every closed Spectral PM Work Order should have the following files uploaded to 
 * .xlsx qualification form
 * .zip InstrumentDataBackup
 
+If onsite labor was less than 45 minutes, it is assumed that the WO was closed due to a lapsed PM and is EXCLUDED.
+
 ## Service Report
 
 Every Work Order (regardless of instrument) should have a Service Report generated and sent to the customer:
 
 * .pdf Service Report
 
-# Region PM Work Orders
+Work Order types excluded: Demo Support, Mentoring, Service Bulletin, Training, TS Parts Order
 
-## Qual Form Attachment
-
+# Data Aggregation {.hidden .unnumbered .unlisted}
 ```{r}
-df_results <- df_wo_files_for_all_fse %>% filter(work_order_type != 'Repair') %>% 
+#######################
+# PM WO for analysis of .xlsx and .zip uploads
+#######################
+df_results_pm <- df_wo_files_for_all_fse %>%
+  filter(work_order_type == 'Preventive Maintenance') %>% 
+  filter(product %in% spectral_products) %>% 
   mutate(zip_exists = ifelse(is.na(zip), 0, 1)) %>% 
   mutate(pdf_exists = ifelse(is.na(pdf), 0, 1)) %>% 
   mutate(xlsx_exists = ifelse(is.na(xlsx), 0, 1)) %>% 
@@ -319,7 +354,52 @@ df_results <- df_wo_files_for_all_fse %>% filter(work_order_type != 'Repair') %>
                               .default = NA)) %>% 
   filter(!is.na(district))
 
-df_results_district <- df_results %>% 
+# #get due date
+# soql_due_date <- paste("
+#   SELECT WorkOrderNumber, Due_Date__c
+#   FROM WorkOrder 
+#   WHERE WorkOrderNumber in ", to_soql(df_results$work_order),
+#   sep = '')
+# df_wo_due_date <- sf_query(soql_due_date) %>% 
+#   rename('due_date' = 'Due_Date__c',
+#          'work_order' = 'WorkOrderNumber')
+# 
+# #join
+# df_results %>% 
+#   left_join(df_wo_due_date, by = 'work_order', relationship = 'one-to-one', multiple = 'first') %>% 
+#   filter(due_date > date('2025-06-30'))
+
+# #pair last onsite timestamp with work order
+# soql_ts <- paste("
+#                  SELECT WorkOrderNumber, Last_timesheet_entry__c, DurationInMinutes
+#                  FROM WorkOrder
+#                  WHERE WorkOrderNumber in ", to_soql(df_results$work_order),
+#                  sep = '')
+# df_soql_ts <- sf_query(soql_ts) %>% 
+#   rename('last_onsite_timesheet' = 'Last_timesheet_entry__c',
+#          'work_order' = 'WorkOrderNumber')
+# df_results <- df_results %>% left_join(df_soql_ts, by = 'work_order', relationship = 'one-to-one', multiple = 'first')
+
+#gather onsite timestamp info
+soql_ts <- paste("SELECT Id, WorkOrderId, TimeSheetEntryNumber, DurationInMinutes, DurationInHours__c, Type, WorkOrder.WorkOrderNumber
+                 FROM TimeSheetEntry
+                 WHERE WorkOrderId in (SELECT Id FROM WorkOrder WHERE WorkOrderNumber in ", to_soql(df_results_pm$work_order),")",
+                 sep='')
+df_soql_ts <- sf_query(soql_ts) %>% 
+  filter(Type == 'Onsite Labour') %>% 
+  group_by(WorkOrder.WorkOrderNumber) %>% 
+  summarize(total_duration__min = sum(DurationInMinutes), .groups = 'drop') %>% 
+  rename('work_order' = 'WorkOrder.WorkOrderNumber',
+         'onsite_duration__minutes' = 'total_duration__min')
+
+#filter out PM work orders without an onsite timestamp or where the timestamp is less than 45 minutes (these may be PM kit consumptions due to lapsed PM)
+df_results_pm_filtered <- df_results_pm %>% 
+  left_join(df_soql_ts, by = 'work_order', relationship = 'one-to-one', multiple = 'first') %>% 
+  filter(!is.na(onsite_duration__minutes)) %>%
+  filter(onsite_duration__minutes > 30)
+
+#group by district
+df_results_pm_district <- df_results_pm_filtered %>% 
   group_by(district) %>% 
   summarize(wo_count = length(unique(work_order)),
            p_zips = mean(zip_exists),
@@ -329,38 +409,9 @@ df_results_district <- df_results %>%
            p_xlsx = mean(xlsx_exists),
            p_conf_xlsx = mean(xlsx_foi),
            .groups = 'drop')
-# df_results_district
-```
 
-```{r, fig.width=9}
-point_size_range <- c(20,30)
-
-g_region <- ggplot(df_results_district, aes(x = p_xlsx, y = reorder(district, p_xlsx)), col = district) +
-    geom_segment(aes(x = 0, xend = p_xlsx, y = district, yend = district, color = district), linewidth = 5) +
-    geom_point(aes(size = wo_count, color = district, fill = 'white'), shape = 21, stroke = 1) +
-    scale_size_continuous(range = point_size_range)+
-    geom_text(aes(label = paste(round(p_xlsx*100, 0), '%', sep='')), hjust = .45, vjust = .33, size = 5, fontface = "bold", color = 'black')+
-    geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
-                  hjust = -1.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*0.2, 
-                  vjust = 0.33), 
-              size = 4, 
-              color = 'darkgray')+
-    annotate('text', label = '(Closed Work Order Count)', x = 0.95, y = .5, size = 4, color = 'darkgray')+
-    # scale_color_manual(values = colors_plot[1:3])+
-  scale_color_manual(values = c('US-Central' = colors_plot[1], 'US-Northeast' = colors_plot[3], 'US-Western' = colors_plot[2]))+
-    scale_fill_manual(values = 'white')+
-    scale_x_continuous(labels = scales::percent_format(), limits = c(0,1.1), breaks = seq(0,1,0.1))+
-    labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.xlsx' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
-    theme_minimal()+
-    theme(legend.position = 'none', 
-          axis.text.x = element_blank(),
-          axis.text.y = element_text(size = 10, color = 'black'))
-g_region
-```
-
-
-```{r}
-df_results_fse <- df_results %>% 
+#group by fse
+df_results_pm_fse <- df_results_pm_filtered %>% 
   group_by(district, fse) %>% 
   summarize(wo_count = length(unique(work_order)),
            p_zips = mean(zip_exists),
@@ -371,70 +422,525 @@ df_results_fse <- df_results %>%
            p_conf_xlsx = mean(xlsx_foi),
            .groups = 'drop')
 
+#######################
+# ALL WO that typically provide service reports
+#######################
+df_results_all <- df_wo_files_for_all_fse %>%
+  filter(!work_order_type %in% c('Demo Support',
+                                 'Mentoring',
+                                 'Service Bulletin',
+                                 'Training',
+                                 'TS Parts Order')) %>%
+  
+  #ensure excluded PMs are removed from this list as well
+  mutate(excluded_pm = case_when((!work_order %in% df_results_pm_filtered$work_order) 
+                                 & work_order_type == 'Preventive Maintenance' 
+                                 & product %in% spectral_products ~ 'Excluded',
+                                 .default = NA)) %>% 
+  filter(is.na(excluded_pm)) %>% 
+  select(-excluded_pm) %>% 
+  
+  # add flags
+  mutate(zip_exists = ifelse(is.na(zip), 0, 1)) %>% 
+  mutate(pdf_exists = ifelse(is.na(pdf), 0, 1)) %>% 
+  mutate(xlsx_exists = ifelse(is.na(xlsx), 0, 1)) %>% 
+  mutate(zip_foi = ifelse(is.na(zip_foi), 0, zip_foi)) %>% 
+  mutate(pdf_foi = ifelse(is.na(pdf_foi), 0, pdf_foi)) %>% 
+  mutate(xlsx_foi = ifelse(is.na(xlsx_foi), 0, xlsx_foi)) %>% 
+  mutate(district = case_when(fse %in% list_fse_central_us ~ 'US-Central',
+                              fse %in% list_fse_northeast_us ~ 'US-Northeast',
+                              fse %in% list_fse_western_us ~ 'US-Western',
+                              .default = NA)) %>% 
+  filter(!is.na(district))
+
+
+#group by district
+df_results_all_district <- df_results_all %>% 
+  group_by(district) %>% 
+  summarize(wo_count = length(unique(work_order)),
+           p_zips = mean(zip_exists),
+           p_conf_zips = mean(zip_foi),
+           p_pdfs = mean(pdf_exists),
+           p_conf_pdfs = mean(pdf_foi),
+           p_xlsx = mean(xlsx_exists),
+           p_conf_xlsx = mean(xlsx_foi),
+           .groups = 'drop')
+
+#group by fse
+df_results_all_fse <- df_results_all %>% 
+  group_by(district, fse) %>% 
+  summarize(wo_count = length(unique(work_order)),
+           p_zips = mean(zip_exists),
+           p_conf_zips = mean(zip_foi),
+           p_pdfs = mean(pdf_exists),
+           p_conf_pdfs = mean(pdf_foi),
+           p_xlsx = mean(xlsx_exists),
+           p_conf_xlsx = mean(xlsx_foi),
+           .groups = 'drop')
+```
+
+# District 
+```{r}
+df_executive_summary <- df_results_pm_district %>%
+  select(district, p_xlsx, p_zips) %>% 
+  left_join(df_results_all_district %>% select(district, p_pdfs), by = 'district', relationship = 'one-to-one') %>% 
+  pivot_longer(cols = c('p_xlsx', 'p_zips', 'p_pdfs'), names_to = 'file_type')
+
+```
+
+
+```{r, fig.width=9, fig.align='center'}
+ggplot(df_executive_summary, aes(
+      x = value,
+      y = district,
+      pattern = file_type,
+      fill = district))+
+   geom_bar_pattern(
+     stat = 'identity', 
+     position = 'dodge',
+     colour = 'white',
+     pattern_fill = 'white',
+     pattern_colour = 'white',
+     pattern_key_scale_factor = 0.5
+    )+
+  theme_minimal()+
+  scale_x_continuous(labels = scales::percent_format(), limits = c(0, 1.1), breaks = seq(0,1.1, .1))+
+  scale_pattern_manual(values = c('p_pdfs' = 'stripe', 
+                                  'p_xlsx' = 'none', 
+                                  'p_zips' = 'circle'),
+                       labels = c('p_pdfs'= 'Service Reports (.pdf)', 
+                                  'p_xlsx' = 'PM Qual Forms (.xlsx)', 
+                                  'p_zips' = 'PM InstrumentDataBackup (.zip)'))+
+  scale_fill_manual(values = colors_plot[1:3])+
+  guides(fill = 'none')+
+  labs(pattern = 'File Type', 
+       x = '', 
+       y='', 
+       title = 'Proportion of Closed Work Orders with Files Uploaded')+
+  geom_text(aes(label = paste(round(value*100, 0), '%', sep='')), 
+            hjust = -0.35, 
+            vjust = 0.33, 
+            color = 'black', 
+            position = position_dodge(width = 0.9))+
+  theme(axis.text.x = element_blank())
+```
+
+
+# FSE
+
+```{r}
+df_executive_summary_fse <- df_results_pm_fse %>%
+  select(district, fse, p_xlsx, p_zips) %>% 
+  left_join(df_results_all_fse %>% select(district, fse, p_pdfs), by = c('district', 'fse'), relationship = 'one-to-one') %>% 
+  pivot_longer(cols = c('p_xlsx', 'p_zips', 'p_pdfs'), names_to = 'file_type')
 ```
 
 ```{r}
-plot_district <- function(selected_plot_color, selected_district){
-  point_size_range = c(20,35)
-  g_district <- ggplot(df_results_fse %>% filter(district == selected_district), aes(x = p_xlsx, y = reorder(fse, p_xlsx)), col = selected_plot_color) +
-    geom_segment(aes(x = 0, xend = p_xlsx, y = fse, yend = fse, color = selected_plot_color), linewidth = 5) +
-    geom_point(aes(size = wo_count, color = selected_plot_color, fill = 'white'), shape = 21, stroke = 1) +
-    scale_size_continuous(range = point_size_range)+
-    geom_text(aes(label = paste(round(p_xlsx*100, 0), '%', sep='')), hjust = .45, vjust = .33, fontface = "bold", size = 5)+
-    geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
-                  hjust = -2.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*.1, 
-                  vjust = 0.33), 
-              size = 4, 
-              color = 'darkgray')+
-    annotate('text', label = '(Closed Work Order Count)', x = 1, y = 0.55, size = 4, color = 'darkgray')+
-    scale_color_manual(values = selected_plot_color)+
-    scale_fill_manual(values = 'white')+
-    scale_x_continuous(labels = scales::percent_format(), limits = c(-0.1,1.2), breaks = seq(-0.1,1.2,0.1))+
-    labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.xlsx' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+plot_district <- function(district_filter, color_selection){
+  
+  g <- ggplot(df_executive_summary_fse %>% filter(district == district_filter), aes(
+        x = value,
+        y = fse,
+        pattern = file_type,
+        fill = color_selection))+
+     geom_bar_pattern(
+       stat = 'identity', 
+       position = 'dodge',
+       colour = 'white',
+       pattern_fill = 'white',
+       pattern_colour = 'white',
+       pattern_key_scale_factor = 0.5
+      )+
     theme_minimal()+
-    theme(legend.position = 'none',
-          axis.text.x = element_blank(),
-          axis.text.y = element_text(size = 10, color = 'black'))
-  return(g_district)
+    scale_x_continuous(labels = scales::percent_format(), limits = c(0, 1.1), breaks = seq(0,1.1, .1))+
+    scale_pattern_manual(values = c('p_pdfs' = 'stripe', 
+                                    'p_xlsx' = 'none', 
+                                    'p_zips' = 'circle'),
+                         labels = c('p_pdfs'= 'Service Reports (.pdf)', 
+                                    'p_xlsx' = 'PM Qual Forms (.xlsx)', 
+                                    'p_zips' = 'PM InstrumentDataBackup (.zip)'))+
+    scale_fill_manual(values = color_selection)+
+    guides(fill = 'none')+
+    labs(pattern = 'File Type', 
+         x = '', 
+         y='', 
+         title = 'Proportion of Closed Work Orders with Files Uploaded')+
+    geom_text(aes(label = paste(round(value*100, 0), '%', sep='')), 
+              hjust = -0.35, 
+              vjust = 0.33, 
+              color = 'black', 
+              position = position_dodge(width = 0.9))+
+    theme(axis.text.x = element_blank(),
+          legend.position = 'right',
+          legend.justification = 'top')
+
+  return(g)
 }
 ```
 
-# FSE PM Work Orders
 
-## Qual Form Attachment
+## US - Central
+```{r, fig.width=9, fig.height=15, fig.align='center'}
+plot_district(district_filter = 'US-Central', 
+              color_selection = colors_plot[1])
+```
 
-### US-Central
+## US - Northeastern
+```{r, fig.width=9, fig.height=15, fig.align='center'}
+plot_district(district_filter = 'US-Northeast', 
+              color_selection = colors_plot[2])
+```
 
-```{r, fig.height=15, fig.width=9}
-
-#central
-g_central <- plot_district(colors_plot[1], 'US-Central')
-g_central
+## US - Western
+```{r, fig.width=9, fig.height=15, fig.align='center'}
+plot_district(district_filter = 'US-Western', 
+              color_selection = colors_plot[3])
 ```
 
 
-### US-Northeast
-```{r, fig.height=15, fig.width=9}
+# Data
+```{r}
+fse_data <- df_results_all %>% 
+  # mutate(excluded_pm = case_when((!work_order %in% df_results_pm_filtered$work_order) 
+  #                                & work_order_type == 'Preventive Maintenance' 
+  #                                & product %in% spectral_products ~ 'Excluded',
+  #                                .default = NA)) %>% 
+  select(district, fse, work_order, work_order_type, serial_number, product, xlsx, zip, pdf, work_order_status, work_order_close_date)
 
-#northeast
-g_northeast <- plot_district(colors_plot[3], 'US-Northeast')
-g_northeast
+datatable(
+  fse_data,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 20,
+    autoWidth = TRUE,
+    dom = 'Bfrtip',
+    buttons = list(
+      list(extend = 'colvis', text = 'Toggle Columns')
+    )
+  ),
+  filter = "top",     # Adds filter boxes above each column
+  rownames = FALSE
+)
+
+
 ```
 
-### US-Western
+
+
+
+```{r, fig.width=9}
+# point_size_range <- c(20,30)
+# 
+# g_region_xlsx <- ggplot(df_results_pm_district, aes(x = p_xlsx, y = reorder(district, p_xlsx)), col = district) +
+#     geom_segment(aes(x = 0, xend = p_xlsx, y = district, yend = district, color = district), linewidth = 5) +
+#     geom_point(aes(size = wo_count, color = district, fill = 'white'), shape = 21, stroke = 1) +
+#     scale_size_continuous(range = point_size_range)+
+#     geom_text(aes(label = paste(round(p_xlsx*100, 0), '%', sep='')), hjust = .45, vjust = .33, size = 5, fontface = "bold", color = 'black')+
+#     geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+#                   hjust = -1.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*0.2, 
+#                   vjust = 0.33), 
+#               size = 4, 
+#               color = 'darkgray')+
+#     annotate('text', label = '(Closed Work Order Count)', x = 0.95, y = .5, size = 4, color = 'darkgray')+
+#     # scale_color_manual(values = colors_plot[1:3])+
+#   scale_color_manual(values = c('US-Central' = colors_plot[1], 'US-Northeast' = colors_plot[3], 'US-Western' = colors_plot[2]))+
+#     scale_fill_manual(values = 'white')+
+#     scale_x_continuous(labels = scales::percent_format(), limits = c(0,1.1), breaks = seq(0,1,0.1))+
+#     labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.xlsx' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+#     theme_minimal()+
+#     theme(legend.position = 'none', 
+#           axis.text.x = element_blank(),
+#           axis.text.y = element_text(size = 10, color = 'black'))
+# g_region_xlsx
+```
+
+```{r, fig.width=9}
+# g_region_zip <- ggplot(df_results_pm_district, aes(x = p_zips, y = reorder(district, p_zips)), col = district) +
+#     geom_segment(aes(x = 0, xend = p_zips, y = district, yend = district, color = district), linewidth = 5) +
+#     geom_point(aes(size = wo_count, color = district, fill = 'white'), shape = 21, stroke = 1) +
+#     scale_size_continuous(range = point_size_range)+
+#     geom_text(aes(label = paste(round(p_zips*100, 0), '%', sep='')), hjust = .45, vjust = .33, size = 5, fontface = "bold", color = 'black')+
+#     geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+#                   hjust = -1.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*0.2, 
+#                   vjust = 0.33), 
+#               size = 4, 
+#               color = 'darkgray')+
+#     annotate('text', label = '(Closed Work Order Count)', x = 0.95, y = .5, size = 4, color = 'darkgray')+
+#     # scale_color_manual(values = colors_plot[1:3])+
+#   scale_color_manual(values = c('US-Central' = colors_plot[1], 'US-Northeast' = colors_plot[3], 'US-Western' = colors_plot[2]))+
+#     scale_fill_manual(values = 'white')+
+#     scale_x_continuous(labels = scales::percent_format(), limits = c(0,1.1), breaks = seq(0,1,0.1))+
+#     labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.zip' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+#     theme_minimal()+
+#     theme(legend.position = 'none', 
+#           axis.text.x = element_blank(),
+#           axis.text.y = element_text(size = 10, color = 'black'))
+# g_region_zip
+```
+
+```{r}
+# df_results_all <- df_wo_files_for_all_fse %>%
+#   filter(!work_order_type %in% c('Demo Support',
+#                                  'Mentoring',
+#                                  'Service Bulletin',
+#                                  'Training',
+#                                  'TS Parts Order')) %>%
+#   # filter(product %in% spectral_products) %>% 
+#   mutate(zip_exists = ifelse(is.na(zip), 0, 1)) %>% 
+#   mutate(pdf_exists = ifelse(is.na(pdf), 0, 1)) %>% 
+#   mutate(xlsx_exists = ifelse(is.na(xlsx), 0, 1)) %>% 
+#   mutate(zip_foi = ifelse(is.na(zip_foi), 0, zip_foi)) %>% 
+#   mutate(pdf_foi = ifelse(is.na(pdf_foi), 0, pdf_foi)) %>% 
+#   mutate(xlsx_foi = ifelse(is.na(xlsx_foi), 0, xlsx_foi)) %>% 
+#   mutate(district = case_when(fse %in% list_fse_central_us ~ 'US-Central',
+#                               fse %in% list_fse_northeast_us ~ 'US-Northeast',
+#                               fse %in% list_fse_western_us ~ 'US-Western',
+#                               .default = NA)) %>% 
+#   filter(!is.na(district))
+# 
+# 
+# #group by district
+# df_results_all_district <- df_results_all %>% 
+#   group_by(district) %>% 
+#   summarize(wo_count = length(unique(work_order)),
+#            p_zips = mean(zip_exists),
+#            p_conf_zips = mean(zip_foi),
+#            p_pdfs = mean(pdf_exists),
+#            p_conf_pdfs = mean(pdf_foi),
+#            p_xlsx = mean(xlsx_exists),
+#            p_conf_xlsx = mean(xlsx_foi),
+#            .groups = 'drop')
+```
+
+```{r, fig.width=9}
+# point_size_range <- c(20,30)
+# 
+# g_region_pdf <- ggplot(df_results_all_district, aes(x = p_pdfs, y = reorder(district, p_pdfs)), col = district) +
+#     geom_segment(aes(x = 0, xend = p_pdfs, y = district, yend = district, color = district), linewidth = 5) +
+#     geom_point(aes(size = wo_count, color = district, fill = 'white'), shape = 21, stroke = 1) +
+#     scale_size_continuous(range = point_size_range)+
+#     geom_text(aes(label = paste(round(p_pdfs*100, 0), '%', sep='')), hjust = .45, vjust = .33, size = 5, fontface = "bold", color = 'black')+
+#     geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+#                   hjust = -1.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*0.2, 
+#                   vjust = 0.33), 
+#               size = 4, 
+#               color = 'darkgray')+
+#     annotate('text', label = '(Closed Work Order Count)', x = 0.95, y = .5, size = 4, color = 'darkgray')+
+#     # scale_color_manual(values = colors_plot[1:3])+
+#   scale_color_manual(values = c('US-Central' = colors_plot[1], 'US-Northeast' = colors_plot[3], 'US-Western' = colors_plot[2]))+
+#     scale_fill_manual(values = 'white')+
+#     scale_x_continuous(labels = scales::percent_format(), limits = c(0,1.1), breaks = seq(0,1,0.1))+
+#     labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.pdf' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+#     theme_minimal()+
+#     theme(legend.position = 'none', 
+#           axis.text.x = element_blank(),
+#           axis.text.y = element_text(size = 10, color = 'black'))
+# g_region_pdf
+```
+
+
+```{r}
+# df_results_pm_fse <- df_results_pm_filtered %>% 
+#   group_by(district, fse) %>% 
+#   summarize(wo_count = length(unique(work_order)),
+#            p_zips = mean(zip_exists),
+#            p_conf_zips = mean(zip_foi),
+#            p_pdfs = mean(pdf_exists),
+#            p_conf_pdfs = mean(pdf_foi),
+#            p_xlsx = mean(xlsx_exists),
+#            p_conf_xlsx = mean(xlsx_foi),
+#            .groups = 'drop')
+
+```
+
+```{r}
+# plot_district_xlsx <- function(selected_plot_color, selected_district){
+#   point_size_range = c(20,35)
+#   g_district <- ggplot(df_results_pm_fse %>% filter(district == selected_district), aes(x = p_xlsx, y = reorder(fse, p_xlsx)), col = selected_plot_color) +
+#     geom_segment(aes(x = 0, xend = p_xlsx, y = fse, yend = fse, color = selected_plot_color), linewidth = 5) +
+#     geom_point(aes(size = wo_count, color = selected_plot_color, fill = 'white'), shape = 21, stroke = 1) +
+#     scale_size_continuous(range = point_size_range)+
+#     geom_text(aes(label = paste(round(p_xlsx*100, 0), '%', sep='')), hjust = .45, vjust = .33, fontface = "bold", size = 5)+
+#     geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+#                   hjust = -2.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*.1, 
+#                   vjust = 0.33), 
+#               size = 4, 
+#               color = 'darkgray')+
+#     annotate('text', label = '(Closed Work Order Count)', x = 1, y = 0.55, size = 4, color = 'darkgray')+
+#     scale_color_manual(values = selected_plot_color)+
+#     scale_fill_manual(values = 'white')+
+#     scale_x_continuous(labels = scales::percent_format(), limits = c(-0.1,1.2), breaks = seq(-0.1,1.2,0.1))+
+#     labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.xlsx' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+#     theme_minimal()+
+#     theme(legend.position = 'none',
+#           axis.text.x = element_blank(),
+#           axis.text.y = element_text(size = 10, color = 'black'))
+#   return(g_district)
+# }
+```
+
+
+
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #central
+# g_central_xlsx <- plot_district_xlsx(colors_plot[1], 'US-Central')
+# g_central_xlsx
+```
+
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #northeast
+# g_northeast_xlsx <- plot_district_xlsx(colors_plot[3], 'US-Northeast')
+# g_northeast_xlsx
+```
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #west
+# g_west_xlsx <- plot_district_xlsx(colors_plot[2], 'US-Western')
+# g_west_xlsx
+```
+
+```{r}
+
+```
+
+
+
+
+```{r}
+# plot_district_zip <- function(selected_plot_color, selected_district){
+#   point_size_range = c(20,35)
+#   g_district <- ggplot(df_results_pm_fse %>% filter(district == selected_district), aes(x = p_zips, y = reorder(fse, p_zips)), col = selected_plot_color) +
+#     geom_segment(aes(x = 0, xend = p_zips, y = fse, yend = fse, color = selected_plot_color), linewidth = 5) +
+#     geom_point(aes(size = wo_count, color = selected_plot_color, fill = 'white'), shape = 21, stroke = 1) +
+#     scale_size_continuous(range = point_size_range)+
+#     geom_text(aes(label = paste(round(p_zips*100, 0), '%', sep='')), hjust = .45, vjust = .33, fontface = "bold", size = 5)+
+#     geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+#                   hjust = -2.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*.1, 
+#                   vjust = 0.33), 
+#               size = 4, 
+#               color = 'darkgray')+
+#     annotate('text', label = '(Closed Work Order Count)', x = 1, y = 0.55, size = 4, color = 'darkgray')+
+#     scale_color_manual(values = selected_plot_color)+
+#     scale_fill_manual(values = 'white')+
+#     scale_x_continuous(labels = scales::percent_format(), limits = c(-0.1,1.2), breaks = seq(-0.1,1.2,0.1))+
+#     labs(y='', x='', title = paste("Proportion of Closed PM Work Orders with '.zip' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+#     theme_minimal()+
+#     theme(legend.position = 'none',
+#           axis.text.x = element_blank(),
+#           axis.text.y = element_text(size = 10, color = 'black'))
+#   return(g_district)
+# }
+```
+
+
+```{r, fig.height=15, fig.width=9}
+# #central
+# g_central_zip <- plot_district_zip(colors_plot[1], 'US-Central')
+# g_central_zip
+```
+
+
 ```{r, fig.height=15, fig.width=9}
 
-#west
-g_west <- plot_district(colors_plot[2], 'US-Western')
-g_west
+# #northeast
+# g_northeast_zip <- plot_district_zip(colors_plot[3], 'US-Northeast')
+# g_northeast_zip
 ```
+
+
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #west
+# g_west_zip <- plot_district_zip(colors_plot[2], 'US-Western')
+# g_west_zip
+```
+
+
+
+```{r}
+# df_results_all_fse <- df_results_all %>% 
+#   group_by(district, fse) %>% 
+#   summarize(wo_count = length(unique(work_order)),
+#            p_zips = mean(zip_exists),
+#            p_conf_zips = mean(zip_foi),
+#            p_pdfs = mean(pdf_exists),
+#            p_conf_pdfs = mean(pdf_foi),
+#            p_xlsx = mean(xlsx_exists),
+#            p_conf_xlsx = mean(xlsx_foi),
+#            .groups = 'drop')
+```
+
+
+```{r}
+# plot_district_pdf <- function(selected_plot_color, selected_district){
+#   point_size_range = c(20,35)
+#   g_district <- ggplot(df_results_all_fse %>% filter(district == selected_district), aes(x = p_pdfs, y = reorder(fse, p_pdfs)), col = selected_plot_color) +
+#     geom_segment(aes(x = 0, xend = p_pdfs, y = fse, yend = fse, color = selected_plot_color), linewidth = 5) +
+#     geom_point(aes(size = wo_count, color = selected_plot_color, fill = 'white'), shape = 21, stroke = 1) +
+#     scale_size_continuous(range = point_size_range)+
+#     geom_text(aes(label = paste(round(p_pdfs*100, 0), '%', sep='')), hjust = .45, vjust = .33, fontface = "bold", size = 5)+
+#     geom_text(aes(label = paste('(',wo_count,')', sep = ''), 
+#                   hjust = -2.5 - (wo_count - min(wo_count)) / (max(wo_count) - min(wo_count))*.1, 
+#                   vjust = 0.33), 
+#               size = 4, 
+#               color = 'darkgray')+
+#     annotate('text', label = '(Closed Work Order Count)', x = 1, y = 0.55, size = 4, color = 'darkgray')+
+#     scale_color_manual(values = selected_plot_color)+
+#     scale_fill_manual(values = 'white')+
+#     scale_x_continuous(labels = scales::percent_format(), limits = c(-0.1,1.2), breaks = seq(-0.1,1.2,0.1))+
+#     labs(y='', x='', title = paste("Proportion of Closed Work Orders with '.pdf' file uploaded (post ", str_split(date_of_interest, 'T')[[1]][1], ')', sep = ''))+
+#     theme_minimal()+
+#     theme(legend.position = 'none',
+#           axis.text.x = element_blank(),
+#           axis.text.y = element_text(size = 10, color = 'black'))
+#   return(g_district)
+# }
+```
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #central
+# g_central_pdf <- plot_district_pdf(colors_plot[1], 'US-Central')
+# g_central_pdf
+```
+
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #northeast
+# g_northeast_pdf <- plot_district_pdf(colors_plot[3], 'US-Northeast')
+# g_northeast_pdf
+```
+
+
+```{r, fig.height=15, fig.width=9}
+# 
+# #west
+# g_west_pdf <- plot_district_pdf(colors_plot[2], 'US-Western')
+# g_west_pdf
+```
+
 
 # plots to png {.hidden .unnumbered .unlisted}
 ```{r}
-# ggsave(filename = 'districts.png', plot = g_region, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
-# ggsave(filename = 'central.png', plot = g_central, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
-# ggsave(filename = 'northeast.png', plot = g_northeast, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
-# ggsave(filename = 'western.png', plot = g_western, width = 6, height = 4.5, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'districts.png', plot = g_region, width = 9, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'central.png', plot = g_central, width = 9, height = 15, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'northeast.png', plot = g_northeast, width = 9, height = 15, dpi = 'retina', bg = 'white')
+# ggsave(filename = 'western.png', plot = g_west, width = 9, height = 15, dpi = 'retina', bg = 'white')
 ```
+
+
 
 
